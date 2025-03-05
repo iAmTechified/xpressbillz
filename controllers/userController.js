@@ -192,7 +192,7 @@ const changeBalance = asyncHandler(async(req, res) => {
 
     const user = await User.findOne({ email });
 
-    if (!email || !balance) {
+    if (!email || balance === null || balance === undefined) {
         return res.status(400).json({
           success: false,
           message: 'Email and pin are required',
