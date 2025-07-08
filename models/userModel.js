@@ -1,40 +1,68 @@
 const mongoose = require('mongoose');
 
 
+
 const userSchema = mongoose.Schema({
-
-    username:{
-        type:String,
-        required:true
-    },
-    password:{
-        type:String,
+    firstName: {
+        type: String,
         required: true
-    },    
-    email:{
-        type:String,
+    },
+    lastName: {
+        type: String,
+        required: true
+    },
+    username: {
+        type: String,
         required: true,
-        unique:true
-
+        trim: true
+        // not unique
     },
-    gender:{
-        type:String,
-        required:false
+    password: {
+        type: String,
+        required: true
     },
-    phoneNumber:{
-        type:String,
-        required:true
+    email: {
+        type: String,
+        required: true,
+        unique: true
     },
-    pin:{
-        type:String,
-        required:true
+    gender: {
+        type: String,
+        required: false
     },
-    balance:{
-        type:Number,
-        default:0
+    phoneNumber: {
+        type: String,
+        required: true
     },
-
-
+    pin: {
+        type: String
+    },
+    balance: {
+        type: Number,
+        default: 0
+    },
+    paystackCustomerId: {
+        type: String,
+        required: false,
+        index: true
+    },
+    paystackCustomerCode: {
+        type: String,
+        required: false,
+        index: true
+    },
+    xpressAccountNumber: {
+        type: String,
+        required: false
+    },
+    xpressAccountName: {
+        type: String,
+        required: false
+    },
+    xpressAccountBank: {
+        type: String,
+        required: false
+    },
 });
 
 

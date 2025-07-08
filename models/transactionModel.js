@@ -53,6 +53,10 @@ const recordSchema = mongoose.Schema({
     planName:{
         type:String,
         required:false
+    },
+    transferDetails:{
+        type:Object,
+        required:false
     }
 
 
