@@ -411,6 +411,7 @@ const syncUserBalance = asyncHandler(async (req, res) => {
             // Save transaction
             await DepositTransaction.create([{
               user: user._id,
+              transactionId: tx.reference,
               reference: tx.reference,
               amount: amountNaira,
               status: 'success',

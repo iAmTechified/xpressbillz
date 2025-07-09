@@ -57,11 +57,11 @@ const getTempAccount = asyncHandler(async (req, res) => {
       name: temp.tempAccountName,
       bank: temp.tempAccountBank,
       expiry: temp.tempAccountExpiry,
-      reference: temp.transactionId,
+      reference: temp.reference,
       amount: temp.amount,
     },
     expiry: temp.tempAccountExpiry,
-    reference: temp.transactionId,
+    reference: temp.reference,
   });
 });
 
@@ -109,9 +109,9 @@ const createTempAccount = asyncHandler(async (req, res) => {
   const deposit = await DepositTransaction.create({
     user: userId,
     paystackCustomerId: data.customer?.customer_code || data.customer?.id || "",
-    paystackReference: reference,
+    paystackReference: data.reference,
     paystackTransactionId: data.id ? String(data.id) : "",
-    transactionId: reference,
+    transactionId: data.reference,
     amount: Number(amount),
     status: "Pending",
     channel: "bank_transfer",
@@ -135,11 +135,11 @@ const createTempAccount = asyncHandler(async (req, res) => {
       name: data.authorization.account_name,
       bank: data.authorization.bank,
       expiry,
-      reference,
+      reference: data.reference,
       amount,
     },
     expiry,
-    reference,
+    reference: data.reference,
   });
 });
 
