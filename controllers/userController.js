@@ -1,8 +1,10 @@
 const asyncHandler = require("express-async-handler");
 const User = require("../models/userModel");
+const DepositTransaction = require("../models/depositTransactionModel");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const axios = require("axios");
+const mongoose = require("mongoose");
 
 const registerUser = asyncHandler(async (req, res) => {
   const { firstName, lastName, username, password, email, gender, phoneNumber, pin } = req.body;
@@ -348,61 +350,100 @@ const getEmailAndPhone = asyncHandler(async (req, res) => {
   });
 });
 
-// Get latest balance and transactions, syncing with Paystack if needed
+// Sync user's balance with Paystack
 const syncUserBalance = asyncHandler(async (req, res) => {
-  const userId = req.user ? req.user._id : req.body._id || req.params.userId;
+  const userId = req.user?._id || req.body._id || req.params.userId;
   if (!userId) {
-    return res.status(400).json({ status: false, message: "User ID required" });
-  }
-  const user = await User.findById(userId);
-  if (!user) {
-    return res.status(404).json({ status: false, message: "User not found" });
+    return res.status(400).json({ status: false, message: 'User ID required' });
   }
 
-  // Check for new credits using Paystack customer id
+  const user = await User.findById(userId);
+  if (!user) {
+    return res.status(404).json({ status: false, message: 'User not found' });
+  }
+
   let newCredits = [];
+
   try {
     if (user.paystackCustomerId) {
-      // Query Paystack for all transactions for this customer
-      const paystackRes = await axios.get(
-        `https://api.paystack.co/transaction?customer=${user.paystackCustomerId}`,
-        {
-          headers: { Authorization: `Bearer ${process.env.PAYSTACK_KEY}` },
-        }
-      );
+      // Get the latest transaction recorded for this user
+      const lastTx = await DepositTransaction.findOne({ user: user._id })
+        .sort({ createdAt: -1 });
+
+      const fromUnix = lastTx
+        ? Math.floor(new Date(lastTx.createdAt).getTime() / 1000)
+        : null;
+
+      let url = `https://api.paystack.co/transaction?customer=${user.paystackCustomerId}`;
+      if (fromUnix) url += `&from=${fromUnix}`;
+
+      // Fetch Paystack transactions
+      const paystackRes = await axios.get(url, {
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_KEY}`,
+        },
+      });
+
       const transactions = paystackRes.data?.data || [];
-      // For each transaction, check if it's already in our DB, if not, credit user
-      for (const tx of transactions) {
-        const exists = await require('../models/depositTransactionModel').findOne({
-          reference: tx.reference,
-          user: user._id,
-        });
-        // Only credit successful transactions
-        if (!exists && tx.status === 'success') {
-          // Credit user and record transaction (convert kobo to naira)
-          user.balance += Number(tx.amount) / 100;
-          await user.save();
-          await require('../models/depositTransactionModel').create({
-            user: user._id,
-            reference: tx.reference,
-            amount: Number(tx.amount) / 100,
-            status: 'success',
-            channel: tx.channel,
-            type: 'DVA',
-            paystackTransactionId: tx.id,
-            paystackCustomerId: tx.customer?.customer_code || tx.customer?.id || '',
-            paystackReference: tx.reference,
-            paystackData: tx,
-          });
-          newCredits.push(tx);
+
+      // Prepare a set of references already saved
+      const references = transactions.map((tx) => tx.reference);
+      const existingTxs = await DepositTransaction.find({
+        reference: { $in: references },
+        user: user._id,
+      }).select('reference');
+
+      const existingRefs = new Set(existingTxs.map((tx) => tx.reference));
+
+      // Start MongoDB session for transaction safety
+      const session = await mongoose.startSession();
+      session.startTransaction();
+
+      try {
+        for (const tx of transactions) {
+          if (
+            !existingRefs.has(tx.reference) &&
+            tx.status === 'success'
+          ) {
+            const amountNaira = Number(tx.amount) / 100;
+
+
+            // Save transaction
+            await DepositTransaction.create([{
+              user: user._id,
+              reference: tx.reference,
+              amount: amountNaira,
+              status: 'success',
+              channel: tx.channel,
+              type: 'DVA',
+              paystackTransactionId: tx.id,
+              paystackCustomerId: tx.customer?.id || tx.customer?.customer_code || '',
+              paystackReference: tx.reference,
+              paystackData: tx,
+            }], { session });
+
+            // Credit user
+            user.balance += amountNaira;
+            await user.save({ session });
+
+            newCredits.push(tx);
+          }
         }
+
+        await session.commitTransaction();
+        session.endSession();
+      } catch (txErr) {
+        await session.abortTransaction();
+        session.endSession();
+        console.error("Transaction sync error:", txErr);
       }
     }
-    // TODO: Add similar logic for temp accounts if needed
   } catch (err) {
-    // Ignore Paystack errors, just return current balance
+    console.error("Paystack API error:", err.response?.data || err.message);
+    // We still return existing balance, no crash
   }
-  res.json({
+
+  return res.json({
     status: true,
     balance: user.balance,
     newCredits,

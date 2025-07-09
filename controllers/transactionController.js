@@ -4,7 +4,9 @@ const axios = require("axios");
 const Record = require("../models/transactionModel");
 const User = require("../models/userModel");
 const DepositTransaction = require("../models/depositTransactionModel");
+const mongoose = require("mongoose");
 // Endpoint: POST /api/transaction/verify-deposit
+
 // Body: { reference, transactionId, userId, channel, depositType, amount, billingEmail, billingName }
 const verifyDeposit = asyncHandler(async (req, res) => {
   const {
@@ -13,108 +15,128 @@ const verifyDeposit = asyncHandler(async (req, res) => {
     userId,
     channel,
     depositType,
-    amount,
     billingEmail,
-    billingName
+    billingName,
   } = req.body;
 
-  if (!reference || !transactionId || !userId || !channel || !depositType || !amount) {
+  if (!reference || !userId || !channel || !depositType) {
     return res.status(400).json({ status: false, message: "Missing required fields" });
   }
 
-  // Query Paystack for transaction status
+  // 1. Verify transaction on Paystack
   let paystackResponse;
   try {
     paystackResponse = await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, {
-      headers: {
-        Authorization: `Bearer ${process.env.PAYSTACK_KEY}`,
-      },
+      headers: { Authorization: `Bearer ${process.env.PAYSTACK_KEY}` },
     });
   } catch (err) {
     return res.status(500).json({ status: false, message: "Failed to verify with Paystack", error: err?.response?.data || err.message });
   }
 
   const data = paystackResponse.data?.data;
-  if (!data || data.status !== "success") {
+  if (!data || data.status != "success") {
     return res.status(400).json({ status: false, message: "Transaction not successful on Paystack", paystack: paystackResponse.data });
   }
 
-  // Check if transaction already exists
-  let existing = await DepositTransaction.findOne({
+  // Extract amount from Paystack (safe)
+  const verifiedAmount = Number(data.amount) / 100;
+
+  // 2. Check if transaction already exists
+  const existing = await DepositTransaction.findOne({
     $or: [
       { paystackReference: reference },
-      { transactionId: transactionId }
+      { paystackTransactionId: String(data.id) },
     ]
   });
+
   if (existing) {
-    // If status is pending, update it
-    if (existing.status === "Pending") {
-      if (data.status === "success") {
-        // Update transaction and user balance
-        const user = await User.findById(userId);
-        if (!user) return res.status(404).json({ status: false, message: "User not found" });
-        const newBalance = user.balance + Number(amount);
-        user.balance = newBalance;
-        await user.save();
-        existing.status = "Success";
-        existing.paystackCustomerId = data.customer?.customer_code || data.customer?.id || "";
-        existing.paystackReference = reference;
-        existing.paystackTransactionId = data.id ? String(data.id) : "";
-        existing.amount = Number(amount);
-        existing.channel = channel;
-        existing.depositType = depositType;
-        existing.reference = data.reference;
-        existing.transferDetails = data;
-        existing.dateofTransaction = new Date(data.paid_at || data.created_at || Date.now());
-        existing.billingEmail = billingEmail || data.customer?.email;
-        existing.billingName = billingName || data.customer?.first_name || "";
-        existing.balanceAfter = newBalance;
-        await existing.save();
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ status: false, message: "User not found" });
+
+    if (existing.status.toLowerCase() == "pending") {
+      // Retry credit with transaction safety
+      const session = await mongoose.startSession();
+      session.startTransaction();
+
+      try {
+
+        Object.assign(existing, {
+          status: "success",
+          amount: verifiedAmount,
+          paystackCustomerId: data.customer?.id || data.customer?.customer_code || "",
+          paystackReference: reference,
+          paystackTransactionId: String(data.id),
+          channel,
+          depositType,
+          reference: data.reference,
+          transferDetails: data,
+          dateofTransaction: new Date(data.paid_at || data.created_at || Date.now()),
+          billingEmail: billingEmail || data.customer?.email,
+          billingName: billingName || data.customer?.first_name || "",
+          balanceAfter: user.balance,
+        });
+
+        await existing.save({ session });
+
+        user.balance += verifiedAmount;
+        await user.save({ session });
+
+        await session.commitTransaction();
+        session.endSession();
+
         return res.status(200).json({ status: true, message: "Deposit updated", user, transaction: existing });
-      } else {
-        // Still pending, just return
-        const user = await User.findById(userId);
-        return res.status(200).json({ status: true, message: "Deposit still pending", user, transaction: existing });
+      } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(500).json({ status: false, message: "Failed to update transaction", error: err.message });
       }
-    } else {
-      // Already processed (Success or Failed)
-      const user = await User.findById(userId);
-      return res.status(200).json({ status: true, message: "Already processed", user, transaction: existing });
     }
+
+    // Already successful or failed
+    const user2 = await User.findById(userId);
+    return res.status(200).json({ status: true, message: "Already processed", user: user2, transaction: existing });
   }
 
-  // Get user
+  // 3. No transaction exists, create new record + update balance atomically
   const user = await User.findById(userId);
-  if (!user) {
-    return res.status(404).json({ status: false, message: "User not found" });
+  if (!user) return res.status(404).json({ status: false, message: "User not found" });
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const deposit = await DepositTransaction.create([{
+      user: userId,
+      paystackCustomerId: data.customer?.customer_code || data.customer?.id || "",
+      paystackReference: reference,
+      paystackTransactionId: String(data.id),
+      transactionId,
+      amount: verifiedAmount,
+      status: "success",
+      channel,
+      depositType,
+      reference: data.reference,
+      transferDetails: data,
+      dateofTransaction: new Date(data.paid_at || data.created_at || Date.now()),
+      billingEmail: billingEmail || data.customer?.email,
+      billingName: billingName || data.customer?.first_name || "",
+      balanceAfter: user.balance,
+    }], { session });
+
+    user.balance += verifiedAmount;
+    await user.save({ session });
+
+    await session.commitTransaction();
+    session.endSession();
+
+    return res.status(201).json({ status: true, message: "Deposit recorded", user, transaction: deposit[0] });
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    return res.status(500).json({ status: false, message: "Failed to record deposit", error: err.message });
   }
-
-  // Update balance
-  const newBalance = user.balance + Number(amount);
-  user.balance = newBalance;
-  await user.save();
-
-  // Save deposit transaction
-  const deposit = await DepositTransaction.create({
-    user: userId,
-    paystackCustomerId: data.customer?.customer_code || data.customer?.id || "",
-    paystackReference: reference,
-    paystackTransactionId: data.id ? String(data.id) : "",
-    transactionId,
-    amount: Number(amount),
-    status: "Success",
-    channel,
-    depositType,
-    reference: data.reference,
-    transferDetails: data,
-    dateofTransaction: new Date(data.paid_at || data.created_at || Date.now()),
-    billingEmail: billingEmail || data.customer?.email,
-    billingName: billingName || data.customer?.first_name || "",
-    balanceAfter: newBalance,
-  });
-
-  return res.status(201).json({ status: true, message: "Deposit recorded", user, transaction: deposit });
 });
+
 
 const createRecord = asyncHandler(async (req, res) => {
   const {
@@ -181,24 +203,101 @@ const createRecord = asyncHandler(async (req, res) => {
   }
 });
 
+// ✅ Get all transactions (deposits + records) for a user
 const getAllRecords = asyncHandler(async (req, res) => {
-  const id = req.params.id; // Access id from URL path
-  const record = await Record.find({ user: id }); // Assuming the field is called user
-  // console.log(id, record); // Log the record to console
-  res.status(200).json(record);
+  const userId = req.params.id;
+
+  if (!userId) {
+    return res.status(400).json({ status: false, message: 'User ID is required' });
+  }
+
+  const deposits = await DepositTransaction.find({ user: userId }).lean();
+  const records = await Record.find({ user: userId }).lean();
+
+  // Normalize both collections
+  const formattedDeposits = deposits.map(tx => ({
+    _id: tx._id,
+    type: 'credit',
+    amount: `+₦${tx.amount}`,
+    dateofTransaction: tx.dateofTransaction || tx.createdAt,
+    status: tx.status || 'Pending',
+    source: 'DepositTransaction',
+    productName: tx.productName || 'Deposit',
+    channel: tx.channel,
+    description: `Deposit via ${tx.channel}`,
+    reference: tx.reference,
+    raw: tx,
+  }));
+
+  const formattedRecords = records.map(tx => ({
+    _id: tx._id,
+    type: 'debit',
+    amount: tx.amount,
+    dateofTransaction: tx.dateofTransaction || tx.createdAt,
+    status: tx.status,
+    source: 'Record',
+    productName: tx.productName,
+    description: `${tx.productName || 'Spending'} transaction`,
+    reference: tx.transactionId,
+    raw: tx,
+  }));
+
+  const allTransactions = [...formattedDeposits, ...formattedRecords].sort(
+    (a, b) => new Date(b.date) - new Date(a.date)
+  );
+
+  res.status(200).json({
+    status: true,
+    count: allTransactions.length,
+    transactions: allTransactions,
+  });
 });
 
+// ✅ Get a specific transaction by user and transaction ID
 const getRecord = asyncHandler(async (req, res) => {
-  console.log(req.params);
-  const { userId, transactionId } = req.params; // Access userId and transactionId from URL path
-  const record = await Record.findOne({ _id: transactionId, user: userId }); // Find record by transactionId and userId
+  const { userId, transactionId } = req.params;
+
+  if (!userId || !transactionId) {
+    return res.status(400).json({ status: false, message: 'User ID and transaction ID are required' });
+  }
+
+  // Try to find in DepositTransaction first
+  let record = await DepositTransaction.findOne({
+    $or: [
+      { _id: transactionId },
+      { transactionId: transactionId },
+      { reference: transactionId },
+    ],
+    user: userId,
+  });
 
   if (record) {
-    res.status(200).json(record);
-  } else {
-    res.status(404);
-    throw new Error("Record not found");
+    return res.status(200).json({
+      type: 'credit',
+      source: 'DepositTransaction',
+      transaction: record,
+    });
   }
+
+  // Try in Record model
+  record = await Record.findOne({
+    $or: [
+      { _id: transactionId },
+      { transactionId: transactionId },
+    ],
+    user: userId,
+  });
+
+  if (record) {
+    return res.status(200).json({
+      type: 'debit',
+      source: 'Record',
+      transaction: record,
+    });
+  }
+
+  res.status(404);
+  throw new Error('Transaction record not found');
 });
 
 const confirmRecord = asyncHandler(async (req, res) => {
@@ -516,7 +615,7 @@ const buyAirtime = asyncHandler(async (req, res) => {
                       : ""
                   }`,
                   amount: `-₦${Number(amount).toLocaleString()}`,
-                  status: `${pending ? "Error" : "Pending"}`,
+                  status: "Failed",
                 };
 
                 if (pending) {
@@ -578,7 +677,7 @@ const buyAirtime = asyncHandler(async (req, res) => {
                       : ""
                   }`,
                   amount: `-₦${Number(amount).toLocaleString()}`,
-                  status: `${pending ? "Success" : "Pending"}`,
+                  status: "Success",
                 };
 
                 if (pending) {
@@ -666,7 +765,7 @@ const buyAirtime = asyncHandler(async (req, res) => {
                 : ""
             }`,
             amount: `-₦${Number(amount).toLocaleString()}`,
-            status: `${pending ? "Error" : "Pending"}`,
+            status: "Failed",
           };
 
           if (pending) {
@@ -725,7 +824,7 @@ const buyAirtime = asyncHandler(async (req, res) => {
                 : ""
             }`,
             amount: `-₦${Number(amount).toLocaleString()}`,
-            status: `${pending ? "Success" : "Pending"}`,
+            status: "Success",
           };
 
           if (pending) {
@@ -972,7 +1071,7 @@ const buyData = asyncHandler(async (req, res) => {
                 // UNKNOWN ERROR
                 if (response.data.status === "error") {
                   // UPDATE RECORD FOR FAILED
-                  storedData.status = "Error";
+                  storedData.status = "Failed";
 
                   // RETURN MONEY TO BALANCE
                   await updateBalance(true);
@@ -1081,7 +1180,7 @@ const buyData = asyncHandler(async (req, res) => {
           ) {
             // UPDATE RECORD FOR FAILED
 
-            storedData.status = `${pending ? "Error" : "Pending"}`;
+            storedData.status = "Failed";
 
             // RETURN MONEY TO BALANCE
             await updateBalance(true);
@@ -1120,7 +1219,7 @@ const buyData = asyncHandler(async (req, res) => {
             }
           } else if (response.data.status === "success") {
             // UPDATE RECORD
-            storedData.status = `${pending ? "Success" : "Pending"}`;
+            storedData.status = "Success";
 
             if (pending) {
               // UPDATE TRANSACTION STATUS
@@ -1348,7 +1447,7 @@ const buyTv = asyncHandler(async (req, res) => {
                 // UNKNOWN ERROR
                 if (response.data.status === "error") {
                   // UPDATE RECORD FOR FAILED
-                  storedData.status = "Error";
+                  storedData.status = "Failed";
 
                   // RETURN MONEY TO BALANCE
                   await updateBalance(true);
@@ -1599,7 +1698,7 @@ const buyElectricity = asyncHandler(async (req, res) => {
         // UNKNOWN ERROR
         if (response.data.status === "error") {
             // UPDATE RECORD FOR FAILED
-            storedData.status = "Error";
+            storedData.status = "Failed";
 
             // RETURN MONEY TO BALANCE
             await updateBalance(true);

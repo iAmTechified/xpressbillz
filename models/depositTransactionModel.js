@@ -23,7 +23,6 @@ const depositTransactionSchema = new mongoose.Schema({
   },
   transactionId: {
     type: String,
-    required: true,
     unique: true,
   },
   amount: {
@@ -32,12 +31,11 @@ const depositTransactionSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['Pending', 'Success', 'Failed'],
     default: 'Pending',
   },
   channel: {
     type: String,
-    enum: ['card', 'bank', 'ussd', 'qr', 'mobile_money', 'bank_transfer'],
+    // enum: ['card', 'bank', 'ussd', 'qr', 'mobile_money', 'bank_transfer'],
     required: true,
   },
   depositType: {
