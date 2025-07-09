@@ -133,7 +133,7 @@ const loginUser = asyncHandler(async (req, res) => {
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   let user;
   if (emailRegex.test(identifier)) {
-    user = await User.findOne({ email: identifier.toLowerCase() });
+    user = await User.findOne({ email: identifier });
   } else {
     user = await User.findOne({ phoneNumber: identifier });
   }
